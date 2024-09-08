@@ -1,43 +1,219 @@
 // TODO: Cache block code functions
 let blockTemplate = document.querySelector("template[data-block-template]")
 
-function* idGeneratorFactory () {
-  let id = 0;
-  while(true) yield id++
-}
+class NotebookScope {
+  static VARIABLES = Symbol("NotebookScope.VARIABLES")
+  static BLOCKS = Symbol("NotebookScope.BLOCKS")
+  static RUNNING_BLOCK = Symbol("NotebookScope.RUNNING_BLOCK")
 
-let RUNNING_BLOCK = null
-let blockIdGenerator = idGeneratorFactory()
-let getNextBlockId = () => blockIdGenerator.next().value
+  /** @type {ProxyHandler<NotebookScope>} */
+  static get proxyHandler() {
+    return {
+      has(target, key) {
+        return !(key in globalThis)
+      },
+      get(target, key) {
+        if(target[NotebookScope.RUNNING_BLOCK] == null) return Reflect.get(target, key)
+        if(typeof key !== "string" || key === "$$SCOPE") return Reflect.get(target, key)
 
-function addBlock() {
-  let block = blockTemplate.content.cloneNode(true)
-  let blockId = getNextBlockId()
-  block.querySelector("[data-block]").dataset.block = blockId
-  $$SCOPE[BLOCKS].set(blockId, { id: blockId, values: new Set() })
-  document.body.insertBefore(block, document.querySelector("[data-action='add']"))
-}
 
-document.body.addEventListener("click", ev => {
-  if(ev.target.matches("[data-action='add']")) {
-    addBlock()
+        if(key.startsWith("$")) {
+          return target.getReactive(key.slice(1))
+        } else {
+          return target.getVariable(key)
+        }
+      },
+      set(target, key, value) {
+        if(key === "$$SCOPE" && Reflect.has(target, "$$SCOPE")) throw new TypeError("Illegal assignment of $$SCOPE")
+
+        if(target[NotebookScope.RUNNING_BLOCK] == null) return Reflect.set(target, key, value)
+        if(typeof key !== "string") return Reflect.set(target, key, value)
+
+        if(key.startsWith("$")) {
+          return target.setReactive(key.slice(1), value)
+        } else {
+          return target.setVariable(key, value)
+        }
+      },
+      deleteProperty(target, key) {
+        if(key === "$$SCOPE") throw new TypeError("Illegal deletion of $$SCOPE")
+        if(typeof key !== "string") return Reflect.deleteProperty(target, key)
+
+        if(key.startsWith("$")) {
+          return target.deleteReactive(key.slice(1))
+        } else {
+          return target.deleteVariable(key)
+        }
+      }
+    }
   }
 
-  if(ev.target.matches("[data-action='run']")) {
-    let block = ev.target.closest("[data-block]"),
-        blockId = Number(block.dataset.block),
-        editor = ev.target.nextElementSibling,
+  static create() {
+    let scope = new Proxy(new NotebookScope(), NotebookScope.proxyHandler)
+    scope.$$SCOPE = scope
+    return scope
+  }
+
+  static BlockIdGenerator = idGeneratorFactory()
+  static getNextBlockId() {
+    return NotebookScope.BlockIdGenerator.next().value
+  }
+
+  constructor() {
+    /** @type Map<string, Variable | Reactive> */
+    this[NotebookScope.VARIABLES] = new Map()
+    /** @type Map<number, Block> */
+    this[NotebookScope.BLOCKS] = new Map()
+    /** @type {Block | null} */
+    this[NotebookScope.RUNNING_BLOCK] = null
+  }
+
+  createVariable(name, value) {
+    let variable = {
+      name,
+      value,
+      reactive: false,
+    }
+    this[NotebookScope.VARIABLES].set(name, variable)
+  }
+
+  getVariable(name) {
+    if(!this[NotebookScope.VARIABLES].has(name)) throw new ReferenceError(`${name} is not defined`)
+    return this[NotebookScope.VARIABLES].get(name).value
+  }
+
+  setVariable(name, value) {
+    if(!this[NotebookScope.VARIABLES].has(name)) return this.createVariable(name, value)
+    
+    let variable = this[NotebookScope.VARIABLES].get(name)
+    if(variable.reactive) {
+      throw new TypeError(`Illegal assignment to reactive ${name} defined in block ${variable.owner.id}`)
+    }
+    variable.value = value
+  }
+
+  deleteVariable(name) {
+    if(!this[NotebookScope.VARIABLES].has(name)) return
+    if(variable.reactive) {
+      throw new TypeError(`Illegal deletion of reactive ${name} as a variable`)
+    }
+    this[NotebookScope.VARIABLES].delete(name)
+  }
+
+  createReactive(name, value) {
+    if(this[NotebookScope.VARIABLES].has(name)) throw new TypeError(`${name} is already defined as a variable`)
+    let variable = {
+      name,
+      value,
+      reactive: true,
+      owner: this[NotebookScope.RUNNING_BLOCK]
+    }
+    this[NotebookScope.VARIABLES].set(name, variable)
+    this[NotebookScope.RUNNING_BLOCK].owned.add(variable)
+  }
+
+  getReactive(name) {
+    if(!this[NotebookScope.VARIABLES].has(name)) throw new ReferenceError(`${name} is not defined`)
+
+    let variable = this[NotebookScope.VARIABLES].get(name)
+    if(!variable.reactive) throw new TypeError(`Illegal reactive access to a non reactive variable ${name}`)
+    // TODO: register dependency
+    return variable.value
+  }
+
+  setReactive(name, value) {
+    if(!this[NotebookScope.VARIABLES].has(name)) return this.createReactive(name, value)
+    
+    let variable = this[NotebookScope.VARIABLES].get(name)
+    if(!variable.reactive) throw new TypeError(`Illegal reactive assignment to a non reactive variable ${name}`)
+    if(variable.owner !== this[NotebookScope.RUNNING_BLOCK]) {
+      throw new TypeError(`Illegal assignment to reactive ${name} defined in block ${variable.owner.id}`)
+    }
+
+    this[NotebookScope.VARIABLES].get(name).value = value
+    // TODO: trigger updates
+  }
+
+  deleteReactive(name) {
+    if(!this[NotebookScope.VARIABLES].has(name)) return
+
+    let variable = this[NotebookScope.VARIABLES].get(name)
+    if(!variable.reactive) throw new TypeError(`Illegal reactive deletion of a non reactive variable ${name}`)
+    this[NotebookScope.VARIABLES].delete(name)
+
+    // TODO: trigger updates
+  }
+
+  addBlock() {
+    let block = blockTemplate.content.cloneNode(true)
+    let blockId = NotebookScope.getNextBlockId()
+    block.querySelector("[data-block]").dataset.block = blockId
+    this[NotebookScope.BLOCKS].set(blockId, { id: blockId, owned: new Set() })
+    document.body.insertBefore(block, document.querySelector("[data-action='add']"))
+  }
+
+  runBlock(id) {
+    let block = document.querySelector(`[data-block="${id}"]`),
+        editor = block.querySelector("textarea"),
         code = editor.value
     
-    console.log("RUN", blockId)
-    RUNNING_BLOCK = $$SCOPE[BLOCKS].get(blockId)
+    this[NotebookScope.RUNNING_BLOCK] = this[NotebookScope.BLOCKS].get(id)
     try {
       new Function(`with(this) { ${code} }`).call($$SCOPE)
     } catch(err) {
       console.error(err)
     } finally {
-      RUNNING_BLOCK = null
+      this[NotebookScope.RUNNING_BLOCK] = null
     }
+  }
+
+  deleteBlock(id) {
+    let block = this[BLOCKS].get(id)
+    for(let value of block.owned) {
+      deleteReactive(value.name)
+    }
+    this[BLOCKS].delete(id)
+    document.querySelector(`[data-block="${id}"]`).remove()
+  }
+}
+
+/**
+  * @typedef {Object} Variable
+  * @property {string} name
+  * @property {*} value
+  * @property {false} reactive
+  */
+
+/**
+  * @typedef {Object} Reactive
+  * @property {string} name
+  * @property {*} value
+  * @property {true} reactive
+  * @property {*} owner
+  */
+
+/**
+  * @typedef {Object} Block
+  * @property {number} id
+  * @property {Set<Reactive>} owned
+  */
+function* idGeneratorFactory () {
+  let id = 0;
+  while(true) yield id++
+}
+
+let $$SCOPE = NotebookScope.create()
+document.body.addEventListener("click", ev => {
+  if(ev.target.matches("[data-action='add']")) {
+    $$SCOPE.addBlock()
+  }
+
+  if(ev.target.matches("[data-action='run']")) {
+    let block = ev.target.closest("[data-block]"),
+        blockId = Number(block.dataset.block)
+    
+    console.log("RUN", blockId)
+    $$SCOPE.runBlock(blockId)
   }
 
   if(ev.target.matches("[data-action='delete']")) {
@@ -45,101 +221,6 @@ document.body.addEventListener("click", ev => {
         blockId = Number(blockEl.dataset.block)
     
     console.log("DELETE", blockId)
-    let block = $$SCOPE[BLOCKS].get(blockId)
-    for(let value of block.values) {
-      $$SCOPE[VALUES].delete(value.name)
-    }
-    $$SCOPE[BLOCKS].delete(blockId)
-    blockEl.remove()
+    $$SCOPE.deleteBlock(blockId)
   }
 })
-
-const VALUES = Symbol("VALUES")
-const BLOCKS = Symbol("BLOCKS")
-
-let $$SCOPE = new Proxy({
-  [VALUES]: new Map(),
-  [BLOCKS]: new Map(),
-}, {
-  has(target, key) {
-    return !(key in globalThis)
-  },
-  get(target, key) {
-    if(key === "$$SCOPE") return Reflect.get(target, key)
-    if(typeof key !== "string") return Reflect.get(target, key)
-
-    if(RUNNING_BLOCK == null) throw new Error("Cannot use scope outside of a block")
-
-    if(key.startsWith("$")) {
-      return getReactive.call(target, key.slice(1))
-    } else {
-      return getVariable.call(target, key)
-    }
-  },
-  set(target, key, value) {
-    if(key === "$$SCOPE") {
-      if(Reflect.has(target, key)) throw new Error("Cannot reassign $$SCOPE")
-      return Reflect.set(target, key, value)
-    }
-
-    if(RUNNING_BLOCK == null) throw new Error("Cannot use scope outside of a block")
-
-    if(key.startsWith("$")) {
-      if(target[VALUES].has(key.slice(1))) return setReactive.call(target, key.slice(1), value)
-      else return createReactive.call(target, key.slice(1), value)
-    } else {
-      if(target[VALUES].has(key)) return setVariable.call(target, key, value)
-      else return createVariable.call(target, key, value)
-    }
-  }
-})
-$$SCOPE.$$SCOPE = $$SCOPE
-
-function createReactive(name, value) {
-  if(this[VALUES].has(name)) throw new Error(`"${name}" is already defined as a variable`)
-  let entry = {
-    name,
-    value,
-    reactive: true,
-    block: RUNNING_BLOCK,
-  }
-  this[VALUES].set(name, entry)
-  RUNNING_BLOCK.values.add(entry)
-}
-
-function getReactive(name) {
-  if(!this[VALUES].has(name)) throw new Error(`"${name}" is not defined`)
-  if(!this[VALUES].get(name).reactive) throw new Error(`"${name}" is not a reactive`)
-  // TODO: register dependency
-  return this[VALUES].get(name).value
-}
-
-function setReactive(name, value) {
-  if(this[VALUES].get(name).block !== RUNNING_BLOCK) {
-    throw new Error(`Reactive "${name}" is already defined in block ${this[VALUES].get(name).block.id}`)
-  }
-
-  this[VALUES].get(name).value = value
-  // TODO: trigger updates
-}
-
-function createVariable(name, value) {
-  let entry = {
-    name,
-    value,
-    reactive: false,
-  }
-  this[VALUES].set(name, entry)
-}
-
-function getVariable(name) {
-  if(!this[VALUES].has(name)) throw new Error(`"${name}" is not defined`)
-  return this[VALUES].get(name).value
-}
-
-function setVariable(name, value) {
-  if(this[VALUES].get(name).reactive) {
-    throw new Error(`Reactive "${name}" is already defined in block ${this[VALUES].get(name).block.id}`)
-  }
-  this[VALUES].get(name).value = value
-}
